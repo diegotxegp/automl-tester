@@ -45,6 +45,42 @@ def download_openml_task_with_splits(task_id):
         print(f"Error downloading task {task_id}: {e}")
         return None, None, None, None, None, None
 
+def get_community_best_performance(task_id, evaluation_measure):
+    """Get the best performance from OpenML community for this task"""
+    try:
+        # Get all evaluations for this task
+        evaluations = openml.evaluations.list_evaluations(task=[task_id], 
+                                                         function=evaluation_measure,
+                                                         output_format='dataframe')
+        
+        if evaluations is not None and len(evaluations) > 0:
+            # Find the best score based on evaluation measure
+            if evaluation_measure in ['area_under_roc_curve', 'accuracy']:
+                # Higher is better
+                best_score = evaluations['value'].max()
+            else:
+                # Lower is better (e.g., mean_squared_error, root_mean_squared_error)
+                best_score = evaluations['value'].min()
+            
+            # Get the flow (algorithm) that achieved this best score
+            best_idx = evaluations['value'].idxmax() if evaluation_measure in ['area_under_roc_curve', 'accuracy'] else evaluations['value'].idxmin()
+            best_flow_id = evaluations.loc[best_idx, 'flow_id']
+            
+            try:
+                best_flow = openml.flows.get_flow(best_flow_id)
+                best_algorithm = best_flow.name
+            except:
+                best_algorithm = f"Flow ID: {best_flow_id}"
+            
+            return best_score, best_algorithm
+        else:
+            print(f"No community evaluations found for task {task_id} with measure {evaluation_measure}")
+            return None, None
+            
+    except Exception as e:
+        print(f"Error getting community best for task {task_id}: {e}")
+        return None, None
+
 def run_ludwig_experiment(train_dataset, test_dataset, target_column, seed):
     try:
         time_limit = 300 if TEST_MODE else 7200
@@ -105,6 +141,25 @@ def compute_statistics(runs_list):
         stats[f"{col}_std"] = df[col].std()
     return stats
 
+def compare_with_community(my_score, community_best, evaluation_measure):
+    """Compare my result with community best and calculate performance metrics"""
+    if community_best is None:
+        return None, None, None
+    
+    # Calculate difference and relative performance
+    difference = my_score - community_best
+    
+    if evaluation_measure in ['area_under_roc_curve', 'accuracy']:
+        # Higher is better
+        relative_performance = (my_score / community_best) * 100
+        performance_status = "Better" if my_score > community_best else "Worse"
+    else:
+        # Lower is better (error metrics)
+        relative_performance = (community_best / my_score) * 100
+        performance_status = "Better" if my_score < community_best else "Worse"
+    
+    return difference, relative_performance, performance_status
+
 def display_and_save_results(all_results):
     # Get the directory where the script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -115,6 +170,41 @@ def display_and_save_results(all_results):
         print(f"\nTask {task_id} ({data['dataset_name']}) - {data['task_type']} Results:")
         print(f"Evaluation measure: {data['evaluation_measure']}")
         
+        # Display community comparison
+        if data.get('community_best') is not None:
+            print(f"\nCommunity Best: {data['community_best']:.4f} (by {data['best_algorithm']})")
+            
+            # Get my best result for comparison
+            eval_measure = data['evaluation_measure']
+            metric_key = None
+            
+            # Map OpenML evaluation measures to Ludwig metrics
+            if eval_measure == 'area_under_roc_curve':
+                metric_key = 'roc_auc'
+            elif eval_measure == 'accuracy':
+                metric_key = 'accuracy'
+            elif eval_measure == 'root_mean_squared_error':
+                metric_key = 'root_mean_squared_error'
+            elif eval_measure == 'mean_squared_error':
+                metric_key = 'mean_squared_error'
+            
+            if metric_key and f"{metric_key}_mean" in data['stats']:
+                my_score = data['stats'][f"{metric_key}_mean"]
+                diff, rel_perf, status = compare_with_community(my_score, data['community_best'], eval_measure)
+                
+                print(f"My Result: {my_score:.4f}")
+                print(f"Difference: {diff:+.4f}")
+                print(f"Relative Performance: {rel_perf:.2f}%")
+                print(f"Status: {status}")
+                
+                # Add comparison metrics to stats
+                data['stats'][f'{metric_key}_vs_community_diff'] = diff
+                data['stats'][f'{metric_key}_vs_community_rel_perf'] = rel_perf
+                data['stats']['community_best'] = data['community_best']
+                data['stats']['best_algorithm'] = data['best_algorithm']
+        else:
+            print("No community benchmark available for comparison")
+        
         runs_df = pd.DataFrame([{
             'seed': run['seed'],
             'task_id': task_id,
@@ -124,6 +214,7 @@ def display_and_save_results(all_results):
             **run['metrics']
         } for run in data["runs"]])
         
+        print("\nDetailed Results:")
         print(runs_df)
         print("\nStatistics:")
         stats_series = pd.Series(data["stats"])
@@ -157,6 +248,10 @@ def main():
         print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
         print(f"Evaluation measure: {evaluation_measure}")
 
+        # Get community best performance
+        print("Getting community best performance...")
+        community_best, best_algorithm = get_community_best_performance(task_id, evaluation_measure)
+
         task_results = []
         for seed in SEEDS:
             print(f"Running seed {seed}...")
@@ -183,7 +278,9 @@ def main():
                 "stats": stats,
                 "evaluation_measure": evaluation_measure,
                 "dataset_name": dataset_name,
-                "task_type": task_type
+                "task_type": task_type,
+                "community_best": community_best,
+                "best_algorithm": best_algorithm
             }
 
     display_and_save_results(all_results)
