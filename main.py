@@ -1,14 +1,14 @@
-import openml
-import pandas as pd
 import os
+import pandas as pd
 import time
+import openml
 from ludwig.automl import auto_train
 
 # List of task IDs
 # Set to True for quick testing
 TEST_MODE = True
-TASK_IDS = [15, 23] if TEST_MODE else [15, 23, 37, 57, 8]
-SEEDS = [42, 123] if TEST_MODE else [42, 123, 2023, 1, 99]
+TASK_IDS = [31] if TEST_MODE else [15, 23, 37, 57, 8]
+SEEDS = [42] if TEST_MODE else [42, 123, 2023, 1, 99]
 
 def download_openml_task_with_splits(task_id):
     try:
@@ -34,11 +34,16 @@ def download_openml_task_with_splits(task_id):
         test_df = X_test.copy()
         test_df[task.target_name] = y_test
         
-        return train_df, test_df, task.target_name
+        # Get evaluation measure, dataset name and task type
+        evaluation_measure = task.evaluation_measure
+        dataset_name = dataset.name
+        task_type = task.task_type
+        
+        return train_df, test_df, task.target_name, evaluation_measure, dataset_name, task_type
         
     except Exception as e:
         print(f"Error downloading task {task_id}: {e}")
-        return None, None, None
+        return None, None, None, None, None, None
 
 def run_ludwig_experiment(train_dataset, test_dataset, target_column, seed):
     try:
@@ -107,10 +112,15 @@ def display_and_save_results(all_results):
     os.makedirs(save_dir, exist_ok=True)
     
     for task_id, data in all_results.items():
-        print(f"\nTask {task_id} Results:")
+        print(f"\nTask {task_id} ({data['dataset_name']}) - {data['task_type']} Results:")
+        print(f"Evaluation measure: {data['evaluation_measure']}")
         
         runs_df = pd.DataFrame([{
             'seed': run['seed'],
+            'task_id': task_id,
+            'dataset_name': data['dataset_name'],
+            'task_type': data['task_type'],
+            'evaluation_measure': data['evaluation_measure'],
             **run['metrics']
         } for run in data["runs"]])
         
@@ -119,22 +129,33 @@ def display_and_save_results(all_results):
         stats_series = pd.Series(data["stats"])
         print(stats_series)
 
-        # Save to CSV
+        # Save to CSV with task_id, dataset_name, task_type and evaluation_measure
         runs_df.to_csv(os.path.join(save_dir, f"task_{task_id}_runs.csv"), index=False)
-        stats_series.to_csv(os.path.join(save_dir, f"task_{task_id}_stats.csv"), 
-                   header=['value'], 
-                   index_label='metric')
+        
+        # Add task info to stats and save
+        stats_with_info = data["stats"].copy()
+        stats_with_info['task_id'] = task_id
+        stats_with_info['dataset_name'] = data['dataset_name']
+        stats_with_info['task_type'] = data['task_type']
+        stats_with_info['evaluation_measure'] = data['evaluation_measure']
+        stats_series_with_info = pd.Series(stats_with_info)
+        stats_series_with_info.to_csv(os.path.join(save_dir, f"task_{task_id}_stats.csv"), 
+                           header=['value'], 
+                           index_label='metric')
 
 def main():
     all_results = {}
 
     for task_id in TASK_IDS:
         print(f"Processing task {task_id}...")
-        train_df, test_df, target_column = download_openml_task_with_splits(task_id)
+        train_df, test_df, target_column, evaluation_measure, dataset_name, task_type = download_openml_task_with_splits(task_id)
         if train_df is None:
             continue
 
+        print(f"Dataset: {dataset_name}")
+        print(f"Task type: {task_type}")
         print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
+        print(f"Evaluation measure: {evaluation_measure}")
 
         task_results = []
         for seed in SEEDS:
@@ -159,7 +180,10 @@ def main():
             stats = compute_statistics(task_results)
             all_results[task_id] = {
                 "runs": task_results,
-                "stats": stats
+                "stats": stats,
+                "evaluation_measure": evaluation_measure,
+                "dataset_name": dataset_name,
+                "task_type": task_type
             }
 
     display_and_save_results(all_results)
