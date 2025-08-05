@@ -1,6 +1,6 @@
 # AutoML Benchmark: Ludwig, AutoGluon, and H2O
 
-A Python script for benchmarking the AutoML capabilities of Ludwig, AutoGluon, and H2O on OpenML tasks.
+A Python script for benchmarking the AutoML capabilities of Ludwig, AutoGluon and H2O on OpenML tasks.
 
 ## Overview
 
