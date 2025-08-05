@@ -32,4 +32,4 @@ The script generates:
 ## Usage
 
 ```bash
-python benchmark_script.py
+python main.py
