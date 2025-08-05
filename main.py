@@ -64,7 +64,7 @@ def run_autogluon_experiment(train_dataset, test_dataset, target_column, seed):
         time_limit = 300 if TEST_MODE else 7200
         
         # Create temporary directory for AutoGluon
-        model_dir = f"./autogluon_models/task_seed_{seed}"
+        model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"autogluon_models/task_seed_{seed}")
         os.makedirs(model_dir, exist_ok=True)
         
         # Determine eval metric based on target type
@@ -86,7 +86,7 @@ def run_autogluon_experiment(train_dataset, test_dataset, target_column, seed):
         ).fit(
             train_data=train_dataset,
             time_limit=time_limit,
-            presets='medium_quality'
+            presets='best_quality'
         )
         
         # Evaluate on test set
@@ -184,10 +184,19 @@ def extract_h2o_metrics(perf, task_type):
             metrics_dict['auc'] = perf.auc() if perf.auc() else None
             metrics_dict['accuracy'] = perf.accuracy()[0][1] if perf.accuracy() else None
             metrics_dict['logloss'] = perf.logloss() if perf.logloss() else None
+            metrics_dict['f1'] = perf.F1()[0][1] if perf.F1() else None
+            metrics_dict['precision'] = perf.precision()[0][1] if perf.precision() else None
+            metrics_dict['recall'] = perf.recall()[0][1] if perf.recall() else None
+            metrics_dict['mcc'] = perf.mcc()[0][1] if perf.mcc() else None
+            metrics_dict['aucpr'] = perf.aucpr() if perf.aucpr() else None
+            metrics_dict['mean_per_class_error'] = perf.mean_per_class_error() if perf.mean_per_class_error() else None
         else:
             metrics_dict['rmse'] = perf.rmse() if perf.rmse() else None
             metrics_dict['mae'] = perf.mae() if perf.mae() else None
             metrics_dict['r2'] = perf.r2() if perf.r2() else None
+            metrics_dict['mse'] = perf.mse() if perf.mse() else None
+            metrics_dict['rmsle'] = perf.rmsle() if perf.rmsle() else None
+            metrics_dict['mean_residual_deviance'] = perf.mean_residual_deviance() if perf.mean_residual_deviance() else None
     except Exception as e:
         print(f"Error extracting H2O metrics: {e}")
     return metrics_dict
