@@ -12,11 +12,13 @@ import gc
 import ray
 
 # Set to True to run in test mode (only one task and one seed)
-TEST_MODE = True
+TEST_MODE = False
 
 # List of task IDs
 TASK_IDS = [52948] if TEST_MODE else [
-    10101, 15, 67141, 31, 37, 9957  # Binary classification
+    10101, 15, 67141, 31, 37, 9957,  # Binary classification
+    3560, 23, 3011, 18, 53,          # Multi-class classification
+    2295, 2301, 52948, 4839          # Regression
 ]
 
 """
