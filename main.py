@@ -30,7 +30,7 @@ TASK_IDS = [52948] if TEST_MODE else [
 SEEDS = [123] if TEST_MODE else [123, 2027, 99]
 
 # Time limit for each method in seconds
-TIME_LIMIT = 300 if TEST_MODE else 600
+TIME_LIMIT = 300 if TEST_MODE else 1000
 
 def download_openml_task_with_splits(task_id):
     try:
