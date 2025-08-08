@@ -1,4 +1,5 @@
 import os
+import sys
 import pandas as pd
 import time
 import openml
@@ -6,11 +7,28 @@ from ludwig.automl import auto_train
 from autogluon.tabular import TabularPredictor
 import h2o
 from h2o.automl import H2OAutoML
+import torch
+import gc
+import ray
+
+# Set to True to run in test mode (only one task and one seed)
+TEST_MODE = True
 
 # List of task IDs
-TEST_MODE = True
-TASK_IDS = [31] if TEST_MODE else [2295, 167141, 2301, 23, 31, 37, 3560, 52948, 18, 4839, 9957, 53] # Cholesterol, Churn, Cloud, Cmc, Credit-g, Diabetes, analcatdata_dmft, liver-disorders, mfeat-morphological,plasma_retinol, qsar-biodeg, vehicle
-SEEDS = [42] if TEST_MODE else [42, 123, 2023, 1, 99]
+TASK_IDS = [52948] if TEST_MODE else [
+    10101, 15, 67141, 31, 37, 9957  # Binary classification
+]
+
+"""
+10101, 15, 67141, 31, 37, 9957,  # Binary classification
+    3560, 23, 3011, 18, 53,          # Multi-class classification
+    2295, 2301, 52948, 4839          # Regression
+"""
+
+SEEDS = [123] if TEST_MODE else [123, 2027, 99]
+
+# Time limit for each method in seconds
+TIME_LIMIT = 300 if TEST_MODE else 600
 
 def download_openml_task_with_splits(task_id):
     try:
@@ -42,41 +60,46 @@ def download_openml_task_with_splits(task_id):
     except Exception as e:
         print(f"Error downloading task {task_id}: {e}")
         return None, None, None, None, None, None
+    
+def clear_resources():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
-def run_ludwig_experiment(train_dataset, test_dataset, target_column, seed):
+    if ray.is_initialized():
+            ray.shutdown()
+
+def run_ludwig_experiment(train_dataset, test_dataset, target_column, seed, task_type):
     try:
-        time_limit = 300 if TEST_MODE else 7200
+        clear_resources()
         results = auto_train(
             dataset=train_dataset,
             target=target_column,
-            time_limit_s=time_limit,
+            time_limit_s=TIME_LIMIT,
             tune_for_memory=False,
-            random_seed=seed
+            random_seed=seed,
+            user_config={
+                'hyperopt': {
+                    'executor': {
+                        'max_concurrent_trials': 4
+                    }
+                }
+            }
         )
-        eval_results = results.best_model.evaluate(test_dataset)
-        return results, eval_results
+        eval_results = results.best_model.evaluate(test_dataset)[0]
+        metrics = extract_ludwig_metrics(eval_results, target_column, task_type)
+        clear_resources()
+        return results, metrics
     except Exception as e:
         print(f"Error in Ludwig training with seed {seed}: {e}")
         return None, None
 
-def run_autogluon_experiment(train_dataset, test_dataset, target_column, seed):
+def run_autogluon_experiment(train_dataset, test_dataset, target_column, seed, task_type):
     try:
-        time_limit = 300 if TEST_MODE else 7200
-        
-        # Create temporary directory for AutoGluon
         model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"autogluon_models/task_seed_{seed}")
         os.makedirs(model_dir, exist_ok=True)
         
-        # Determine eval metric based on target type
-        if train_dataset[target_column].dtype == 'object' or train_dataset[target_column].nunique() <= 10:
-            # Classification
-            if train_dataset[target_column].nunique() == 2:
-                eval_metric = 'roc_auc'  # Binary classification
-            else:
-                eval_metric = 'accuracy'  # Multi-class classification
-        else:
-            # Regression
-            eval_metric = 'rmse'
+        eval_metric = 'roc_auc' if 'classification' in task_type.lower() and train_dataset[target_column].nunique() == 2 else 'accuracy' if 'classification' in task_type.lower() else 'rmse'
         
         predictor = TabularPredictor(
             label=target_column,
@@ -85,30 +108,23 @@ def run_autogluon_experiment(train_dataset, test_dataset, target_column, seed):
             verbosity=2
         ).fit(
             train_data=train_dataset,
-            time_limit=time_limit,
-            presets='best_quality'
+            time_limit=TIME_LIMIT,
+            presets='medium_quality'
         )
         
-        # Evaluate on test set
         eval_results = predictor.evaluate(test_dataset, silent=False)
-        
-        return predictor, eval_results
+        metrics = extract_autogluon_metrics(eval_results, task_type)
+        return predictor, metrics
     except Exception as e:
         print(f"Error in AutoGluon training with seed {seed}: {e}")
-        import traceback
-        traceback.print_exc()
         return None, None
 
-def run_h2o_experiment(train_dataset, test_dataset, target_column, seed):
+def run_h2o_experiment(train_dataset, test_dataset, target_column, seed, task_type):
     try:
-        time_limit = 300 if TEST_MODE else 7200
-        
-        # Convert to H2O frames
         h2o_train = h2o.H2OFrame(train_dataset)
         h2o_test = h2o.H2OFrame(test_dataset)
         
-        # Set target as factor for classification
-        if train_dataset[target_column].dtype == 'object' or train_dataset[target_column].nunique() < 10:
+        if 'classification' in task_type.lower():
             h2o_train[target_column] = h2o_train[target_column].asfactor()
             h2o_test[target_column] = h2o_test[target_column].asfactor()
         
@@ -116,87 +132,102 @@ def run_h2o_experiment(train_dataset, test_dataset, target_column, seed):
         x.remove(target_column)
         
         aml = H2OAutoML(
-            max_runtime_secs=time_limit,
+            max_runtime_secs=TIME_LIMIT,
             seed=seed,
             project_name=f"automl_task_{seed}"
         )
         
         aml.train(x=x, y=target_column, training_frame=h2o_train)
         
-        # Evaluate on test set
         perf = aml.leader.model_performance(h2o_test)
-        
-        return aml, perf
+        metrics = extract_h2o_metrics(perf, task_type)
+        return aml, metrics
     except Exception as e:
         print(f"Error in H2O training with seed {seed}: {e}")
         return None, None
 
-def extract_ludwig_metrics(eval_results, target_column):
+def safe_metric_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.lower() in ['nan', 'inf', '-inf', 'null', 'none']:
+            return None
+        try:
+            return float(value)
+        except:
+            return None
+    if isinstance(value, (int, float)):
+        if str(value).lower() in ['nan', 'inf', '-inf']:
+            return None
+    return value
+
+def extract_ludwig_metrics(eval_results, target_column, task_type):
     metrics_dict = {}
     try:
-        if isinstance(eval_results, tuple) and len(eval_results) > 0:
-            eval_stats = eval_results[0]
-            
-            if target_column in eval_stats:
-                feature_metrics = eval_stats[target_column]
-            elif 'combined' in eval_stats:
-                feature_metrics = eval_stats['combined']
-            else:
-                feature_metrics = next(iter(eval_stats.values()))
-            
-            for metric_name, metric_value in feature_metrics.items():
-                metrics_dict[metric_name] = metric_value
-                
+        print(f"Ludwig eval_results: {eval_results}")  # Debug output
+        feature_metrics = eval_results.get(target_column, eval_results.get('combined', next(iter(eval_results.values()))))
+        if 'classification' in task_type.lower():
+            for metric in ['loss', 'roc_auc', 'accuracy', 'accuracy_micro', 'hits_at_k', 'precision', 'recall', 'specificity']:
+                if metric in feature_metrics:
+                    metrics_dict[metric] = safe_metric_value(feature_metrics[metric])
+        else:
+            for metric in ["loss", "root_mean_squared_error", "root_mean_squared_percentage_error", "r2", "mean_absolute_error", "mean_squared_error", "mean_absolute_percentage_error"]:
+                if metric in feature_metrics:
+                    metrics_dict[metric] = safe_metric_value(feature_metrics[metric])
     except Exception as e:
         print(f"Error extracting Ludwig metrics: {e}")
-    
     return metrics_dict
 
-def extract_autogluon_metrics(eval_results):
+def extract_autogluon_metrics(eval_results, task_type):
     metrics_dict = {}
     try:
-        print(f"AutoGluon eval_results type: {type(eval_results)}")
-        print(f"AutoGluon eval_results content: {eval_results}")
-        
+        print(f"AutoGluon eval_results: {eval_results}")  # Debug output
         if isinstance(eval_results, dict):
-            for metric_name, metric_value in eval_results.items():
-                metrics_dict[metric_name] = metric_value
-        elif isinstance(eval_results, (int, float)):
-            metrics_dict['score'] = eval_results
-        else:
-            # Try to convert to dict if it has attributes
-            if hasattr(eval_results, '__dict__'):
-                metrics_dict = eval_results.__dict__
+            if 'classification' in task_type.lower():
+                for metric in ['accuracy', 'balanced_accuracy', 'mcc']:
+                    if metric in eval_results:
+                        metrics_dict[metric] = safe_metric_value(eval_results[metric])
             else:
-                metrics_dict['score'] = float(eval_results) if eval_results is not None else 0.0
-                
+                for metric in ['root_mean_squared_error', 'mean_squared_error', 'mean_absolute_error', 'r2', 'pearsonr', 'median_absolute_error']:
+                    if metric in eval_results:
+                        metrics_dict[metric] = safe_metric_value(eval_results[metric])
+        else:
+            metrics_dict['score'] = safe_metric_value(eval_results)
     except Exception as e:
         print(f"Error extracting AutoGluon metrics: {e}")
-        import traceback
-        traceback.print_exc()
-    
     return metrics_dict
+
+def safe_h2o_metric(metric_func):
+    try:
+        value = metric_func()
+        print(f"H2O metric output: {value}")  # Debug output
+        if isinstance(value, list) and len(value) > 0:
+            if isinstance(value[0], list) and len(value[0]) > 1:
+                value = value[0][1]
+        return safe_metric_value(value)
+    except Exception as e:
+        print(f"Error in safe_h2o_metric: {e}")
+        return None
 
 def extract_h2o_metrics(perf, task_type):
     metrics_dict = {}
     try:
         if 'classification' in task_type.lower():
-            metrics_dict['auc'] = perf.auc() if perf.auc() else None
-            metrics_dict['accuracy'] = perf.accuracy()[0][1] if perf.accuracy() else None
-            metrics_dict['logloss'] = perf.logloss() if perf.logloss() else None
-            metrics_dict['f1'] = perf.F1()[0][1] if perf.F1() else None
-            metrics_dict['precision'] = perf.precision()[0][1] if perf.precision() else None
-            metrics_dict['recall'] = perf.recall()[0][1] if perf.recall() else None
-            metrics_dict['mcc'] = perf.mcc()[0][1] if perf.mcc() else None
-            metrics_dict['aucpr'] = perf.aucpr() if perf.aucpr() else None
-            metrics_dict['mean_per_class_error'] = perf.mean_per_class_error() if perf.mean_per_class_error() else None
+            metrics_dict['accuracy'] = safe_h2o_metric(lambda: perf.accuracy())
+            metrics_dict['f1'] = safe_h2o_metric(lambda: perf.F1())
+            metrics_dict['precision'] = safe_h2o_metric(lambda: perf.precision())
+            metrics_dict['recall'] = safe_h2o_metric(lambda: perf.recall())
+            metrics_dict['roc_auc'] = safe_h2o_metric(lambda: perf.auc())
+            metrics_dict['logloss'] = safe_h2o_metric(lambda: perf.logloss())
+            metrics_dict['aucpr'] = safe_h2o_metric(lambda: perf.aucpr())
+            metrics_dict['mean_per_class_error'] = safe_h2o_metric(lambda: perf.mean_per_class_error())
         else:
-            metrics_dict['rmse'] = perf.rmse() if perf.rmse() else None
-            metrics_dict['mae'] = perf.mae() if perf.mae() else None
-            metrics_dict['r2'] = perf.r2() if perf.r2() else None
-            metrics_dict['mse'] = perf.mse() if perf.mse() else None
-            metrics_dict['rmsle'] = perf.rmsle() if perf.rmsle() else None
-            metrics_dict['mean_residual_deviance'] = perf.mean_residual_deviance() if perf.mean_residual_deviance() else None
+            metrics_dict['r2'] = safe_h2o_metric(lambda: perf.r2())
+            metrics_dict['rmse'] = safe_h2o_metric(lambda: perf.rmse())
+            metrics_dict['mae'] = safe_h2o_metric(lambda: perf.mae())
+            metrics_dict['mse'] = safe_h2o_metric(lambda: perf.mse())
+            metrics_dict['rmsle'] = safe_h2o_metric(lambda: perf.rmsle())
+            metrics_dict['mean_residual_deviance'] = safe_h2o_metric(lambda: perf.mean_residual_deviance())
     except Exception as e:
         print(f"Error extracting H2O metrics: {e}")
     return metrics_dict
@@ -212,16 +243,12 @@ def compute_statistics(runs_list):
 
 def compare_results(all_results):
     comparison_data = []
-    
     for task_id, methods_data in all_results.items():
         for method, data in methods_data.items():
             if method in ['dataset_name', 'task_type', 'evaluation_measure']:
                 continue
-            
-            # Skip if no stats (no successful runs)
             if 'stats' not in data or not data['stats']:
                 continue
-                
             row = {
                 'task_id': task_id,
                 'method': method,
@@ -229,16 +256,11 @@ def compare_results(all_results):
                 'task_type': methods_data['task_type'],
                 'evaluation_measure': methods_data['evaluation_measure']
             }
-            
-            # Add mean metrics
             for key, value in data['stats'].items():
                 if key.endswith('_mean'):
                     row[key] = value
-            
             comparison_data.append(row)
-    
-    comparison_df = pd.DataFrame(comparison_data)
-    return comparison_df
+    return pd.DataFrame(comparison_data)
 
 def display_and_save_results(all_results):
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -248,8 +270,6 @@ def display_and_save_results(all_results):
     for task_id, data in all_results.items():
         print(f"\nTask {task_id} ({data['dataset_name']}) - {data['task_type']} Results:")
         print(f"Evaluation measure: {data['evaluation_measure']}")
-        
-        # Display results for each method
         for method in ['ludwig', 'autogluon', 'h2o']:
             if method in data and data[method]['runs']:
                 print(f"\n{method.upper()} Results:")
@@ -258,38 +278,27 @@ def display_and_save_results(all_results):
                     **run['metrics']
                 } for run in data[method]["runs"]])
                 print(runs_df)
-                
-                # Save individual results
                 runs_df.to_csv(os.path.join(save_dir, f"task_{task_id}_{method}_runs.csv"), index=False)
-                
-                # Print stats if available
                 if 'stats' in data[method] and data[method]['stats']:
                     print(f"{method.upper()} Statistics:")
-                    stats_series = pd.Series(data[method]['stats'])
-                    print(stats_series)
+                    print(pd.Series(data[method]['stats']))
     
-    # Create and save comparison
     comparison_df = compare_results(all_results)
     comparison_df.to_csv(os.path.join(save_dir, "methods_comparison.csv"), index=False)
     print("\nComparison Summary:")
     print(comparison_df)
 
 def main():
-    # Initialize H2O
     h2o.init()
-    
     all_results = {}
-
     for task_id in TASK_IDS:
         print(f"Processing task {task_id}...")
         train_df, test_df, target_column, evaluation_measure, dataset_name, task_type = download_openml_task_with_splits(task_id)
         if train_df is None:
             continue
-
         print(f"Dataset: {dataset_name}")
         print(f"Task type: {task_type}")
         print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
-
         task_results = {
             'dataset_name': dataset_name,
             'task_type': task_type,
@@ -298,68 +307,49 @@ def main():
             'autogluon': {'runs': []},
             'h2o': {'runs': []}
         }
-
         for seed in SEEDS:
             print(f"Running seed {seed}...")
-            
-            # Ludwig
             print("Running Ludwig...")
             start_time = time.time()
-            ludwig_results, ludwig_eval = run_ludwig_experiment(train_df, test_df, target_column, seed)
+            ludwig_results, ludwig_metrics = run_ludwig_experiment(train_df, test_df, target_column, seed, task_type)
             ludwig_time = time.time() - start_time
-            
-            if ludwig_results and ludwig_eval:
-                metrics = extract_ludwig_metrics(ludwig_eval, target_column)
-                metrics['time_taken'] = ludwig_time
+            if ludwig_results and ludwig_metrics:
+                ludwig_metrics['time_taken'] = ludwig_time
                 task_results['ludwig']['runs'].append({
                     'seed': seed,
-                    'metrics': metrics
+                    'metrics': ludwig_metrics
                 })
                 print(f"Ludwig completed in {ludwig_time:.2f}s")
             
-            # AutoGluon
             print("Running AutoGluon...")
             start_time = time.time()
-            ag_results, ag_eval = run_autogluon_experiment(train_df, test_df, target_column, seed)
+            ag_results, ag_metrics = run_autogluon_experiment(train_df, test_df, target_column, seed, task_type)
             ag_time = time.time() - start_time
-            
-            if ag_results and ag_eval is not None:
-                metrics = extract_autogluon_metrics(ag_eval)
-                metrics['time_taken'] = ag_time
+            if ag_results and ag_metrics:
+                ag_metrics['time_taken'] = ag_time
                 task_results['autogluon']['runs'].append({
                     'seed': seed,
-                    'metrics': metrics
+                    'metrics': ag_metrics
                 })
                 print(f"AutoGluon completed in {ag_time:.2f}s")
-            else:
-                print(f"AutoGluon failed for seed {seed}")
             
-            # H2O
             print("Running H2O...")
             start_time = time.time()
-            h2o_results, h2o_eval = run_h2o_experiment(train_df, test_df, target_column, seed)
+            h2o_results, h2o_metrics = run_h2o_experiment(train_df, test_df, target_column, seed, task_type)
             h2o_time = time.time() - start_time
-            
-            if h2o_results and h2o_eval:
-                metrics = extract_h2o_metrics(h2o_eval, task_type)
-                metrics['time_taken'] = h2o_time
+            if h2o_results and h2o_metrics:
+                h2o_metrics['time_taken'] = h2o_time
                 task_results['h2o']['runs'].append({
                     'seed': seed,
-                    'metrics': metrics
+                    'metrics': h2o_metrics
                 })
                 print(f"H2O completed in {h2o_time:.2f}s")
-
-        # Compute statistics for each method
         for method in ['ludwig', 'autogluon', 'h2o']:
             if task_results[method]['runs']:
                 task_results[method]['stats'] = compute_statistics(task_results[method]['runs'])
-
         all_results[task_id] = task_results
-
     display_and_save_results(all_results)
     print("All tasks processed.")
-    
-    # Shutdown H2O
     h2o.shutdown()
 
 if __name__ == "__main__":
