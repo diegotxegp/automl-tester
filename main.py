@@ -11,22 +11,17 @@ from h2o.automl import H2OAutoML
 TEST_MODE = False
 
 # FRAMEWORKS TO RUN - Set to True/False to enable/disable each framework
+# To avoid running all frameworks, set the ones you want to test to True
 RUN_LUDWIG = True
 RUN_AUTOGLUON = False
 RUN_H2O = False
 
 # List of task IDs
 TASK_IDS = [52948] if TEST_MODE else [
-    10101, 15, 31, 37, 9957,  # Binary classification
+    10101, 15, 31, 37, 9957,         # Binary classification
     3560, 23, 3011, 18, 53,          # Multi-class classification
     2295, 2301, 52948, 4839          # Regression
 ]
-
-"""
-    10101, 15, 31, 37, 9957,  # Binary classification
-    3560, 23, 3011, 18, 53,          # Multi-class classification
-    2295, 2301, 52948, 4839          # Regression
-"""
 
 SEEDS = [123] if TEST_MODE else [123, 2027, 99]
 
