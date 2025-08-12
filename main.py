@@ -279,9 +279,9 @@ def compare_results(all_results):
                 'task_type': methods_data['task_type'],
                 'evaluation_measure': methods_data['evaluation_measure']
             }
+            # Include both mean and std metrics
             for key, value in data['stats'].items():
-                if key.endswith('_mean'):
-                    row[key] = value
+                row[key] = value  # Changed to include all stats (mean and std)
             comparison_data.append(row)
     return pd.DataFrame(comparison_data)
 
