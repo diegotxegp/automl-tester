@@ -141,9 +141,12 @@ def run_h2o_experiment(train_dataset, test_dataset, target_column, seed, task_ty
         h2o_train = h2o.H2OFrame(train_dataset)
         h2o_test = h2o.H2OFrame(test_dataset)
         
+        num_classes = None
         if 'classification' in task_type.lower():
             h2o_train[target_column] = h2o_train[target_column].asfactor()
             h2o_test[target_column] = h2o_test[target_column].asfactor()
+            # Get number of classes for multi-class detection
+            num_classes = h2o_train[target_column].nlevels()[0]
         
         x = h2o_train.columns
         x.remove(target_column)
@@ -157,7 +160,7 @@ def run_h2o_experiment(train_dataset, test_dataset, target_column, seed, task_ty
         aml.train(x=x, y=target_column, training_frame=h2o_train)
         
         perf = aml.leader.model_performance(h2o_test)
-        metrics = extract_h2o_metrics(perf, task_type)
+        metrics = extract_h2o_metrics(perf, task_type, num_classes)
         
         h2o.remove([h2o_train, h2o_test])
         try:
@@ -220,37 +223,190 @@ def extract_autogluon_metrics(eval_results, task_type):
         print(f"Error extracting AutoGluon metrics: {e}")
     return metrics_dict
 
-def safe_h2o_metric(metric_func):
+def safe_h2o_metric(metric_func, is_multiclass=False, metric_name=None):
     try:
         value = metric_func()
-        print(f"H2O metric output: {value}")
-        if isinstance(value, list) and len(value) > 0:
-            if isinstance(value[0], list) and len(value[0]) > 1:
-                value = value[0][1]
+        print(f"H2O metric output for {metric_name}: {value} (type: {type(value)})")
+        
+        if is_multiclass:
+            # For multi-class classification, H2O returns different formats
+            if metric_name == 'accuracy':
+                # For multi-class accuracy, H2O should return the overall accuracy directly
+                # If it returns a matrix, extract the overall accuracy
+                if isinstance(value, list):
+                    if len(value) == 1 and isinstance(value[0], (int, float)):
+                        return safe_metric_value(value[0])
+                    # If it's a confusion matrix format, calculate accuracy
+                    elif len(value) > 0 and isinstance(value[0], list):
+                        # Try to calculate accuracy from confusion matrix
+                        total_correct = 0
+                        total_samples = 0
+                        for i, row in enumerate(value[:-1]):  # Exclude totals row if present
+                            for j, cell in enumerate(row[:-1]):  # Exclude totals column if present
+                                if isinstance(cell, (int, float)):
+                                    total_samples += cell
+                                    if i == j:  # Diagonal elements are correct predictions
+                                        total_correct += cell
+                        if total_samples > 0:
+                            return safe_metric_value(total_correct / total_samples)
+                return safe_metric_value(value)
+                
+            elif metric_name in ['f1', 'precision', 'recall']:
+                # For F1, precision, recall in multi-class, calculate macro average
+                if isinstance(value, list) and len(value) > 0:
+                    if isinstance(value[0], list):
+                        # Each row represents a class, extract the metric value for each class
+                        class_values = []
+                        for row in value:
+                            if len(row) >= 2 and isinstance(row[1], (int, float)):
+                                class_values.append(row[1])
+                        if class_values:
+                            return safe_metric_value(sum(class_values) / len(class_values))
+                    else:
+                        # If it's already a list of values, calculate mean
+                        numeric_values = [v for v in value if isinstance(v, (int, float))]
+                        if numeric_values:
+                            return safe_metric_value(sum(numeric_values) / len(numeric_values))
+            
+            # For other metrics, try to extract a single value
+            if isinstance(value, list):
+                if len(value) == 1:
+                    return safe_metric_value(value[0])
+                elif len(value) > 1 and isinstance(value[0], list):
+                    # Look for a summary value (often in the last position)
+                    if len(value[-1]) > 0:
+                        return safe_metric_value(value[-1][-1])
+        else:
+            # For binary classification, handle as before
+            if isinstance(value, list) and len(value) > 0:
+                if isinstance(value[0], list) and len(value[0]) > 1:
+                    value = value[0][1]
+                elif len(value) == 1:
+                    value = value[0]
+        
         return safe_metric_value(value)
     except Exception as e:
-        print(f"Error in safe_h2o_metric: {e}")
+        print(f"Error in safe_h2o_metric for {metric_name}: {e}")
         return None
 
-def extract_h2o_metrics(perf, task_type):
+def extract_h2o_metrics(perf, task_type, num_classes=None):
     metrics_dict = {}
     try:
         if 'classification' in task_type.lower():
-            metrics_dict['accuracy'] = safe_h2o_metric(lambda: perf.accuracy())
-            metrics_dict['f1'] = safe_h2o_metric(lambda: perf.F1())
-            metrics_dict['precision'] = safe_h2o_metric(lambda: perf.precision())
-            metrics_dict['recall'] = safe_h2o_metric(lambda: perf.recall())
-            metrics_dict['roc_auc'] = safe_h2o_metric(lambda: perf.auc())
-            metrics_dict['logloss'] = safe_h2o_metric(lambda: perf.logloss())
-            metrics_dict['aucpr'] = safe_h2o_metric(lambda: perf.aucpr())
-            metrics_dict['mean_per_class_error'] = safe_h2o_metric(lambda: perf.mean_per_class_error())
+            # Detect if it's multi-class (more than 2 classes)
+            is_multiclass = num_classes is not None and num_classes > 2
+            
+            if is_multiclass:
+                # For multi-class classification, extract metrics from confusion matrix
+                print(f"Processing multi-class classification with {num_classes} classes")
+                
+                try:
+                    # Get confusion matrix for detailed metrics calculation
+                    cm = perf.confusion_matrix()
+                    if cm is not None:
+                        cm_df = cm.as_data_frame()
+                        print(f"Confusion Matrix shape: {cm_df.shape}")
+                        print(f"Confusion Matrix columns: {cm_df.columns.tolist()}")
+                        
+                        if not cm_df.empty and len(cm_df) > 1:
+                            # Calculate overall accuracy
+                            total_correct = 0
+                            total_samples = 0
+                            class_metrics = []
+                            
+                            # Process each class (exclude last row/column which are totals)
+                            num_classes_cm = min(len(cm_df) - 1, len(cm_df.columns) - 1)
+                            
+                            for i in range(num_classes_cm):
+                                class_stats = {'true_positive': 0, 'false_positive': 0, 'false_negative': 0, 'true_negative': 0}
+                                
+                                for j in range(num_classes_cm):
+                                    cell_value = cm_df.iloc[i, j]
+                                    if isinstance(cell_value, (int, float)):
+                                        total_samples += cell_value
+                                        
+                                        if i == j:  # True positives for class i
+                                            class_stats['true_positive'] = cell_value
+                                            total_correct += cell_value
+                                        else:
+                                            if i < num_classes_cm:  # False negatives for class i (predicted as other classes)
+                                                class_stats['false_negative'] += cell_value
+                                            if j < num_classes_cm:  # False positives for class i (other classes predicted as i)
+                                                class_stats['false_positive'] += cm_df.iloc[j, i] if isinstance(cm_df.iloc[j, i], (int, float)) else 0
+                                
+                                # Calculate per-class metrics
+                                tp = class_stats['true_positive']
+                                fp = class_stats['false_positive'] 
+                                fn = class_stats['false_negative']
+                                
+                                # Precision = TP / (TP + FP)
+                                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                                
+                                # Recall = TP / (TP + FN)
+                                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                                
+                                # F1 = 2 * (precision * recall) / (precision + recall)
+                                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                                
+                                class_metrics.append({
+                                    'precision': precision,
+                                    'recall': recall,
+                                    'f1': f1
+                                })
+                            
+                            # Calculate macro averages
+                            if class_metrics:
+                                metrics_dict['accuracy'] = total_correct / total_samples if total_samples > 0 else 0
+                                metrics_dict['precision'] = sum(cm['precision'] for cm in class_metrics) / len(class_metrics)
+                                metrics_dict['recall'] = sum(cm['recall'] for cm in class_metrics) / len(class_metrics)
+                                metrics_dict['f1'] = sum(cm['f1'] for cm in class_metrics) / len(class_metrics)
+                                
+                                print(f"Calculated metrics - Accuracy: {metrics_dict['accuracy']:.4f}, "
+                                      f"Precision: {metrics_dict['precision']:.4f}, "
+                                      f"Recall: {metrics_dict['recall']:.4f}, "
+                                      f"F1: {metrics_dict['f1']:.4f}")
+                                
+                except Exception as e:
+                    print(f"Could not extract detailed metrics from confusion matrix: {e}")
+                    # Fallback: set accuracy only and None for others
+                    try:
+                        # Try alternative method for accuracy
+                        if hasattr(perf, 'mean_per_class_accuracy'):
+                            metrics_dict['accuracy'] = safe_h2o_metric(lambda: perf.mean_per_class_accuracy(), is_multiclass, 'mean_per_class_accuracy')
+                    except:
+                        pass
+                    
+                    # Set unavailable metrics to None
+                    if 'accuracy' not in metrics_dict:
+                        metrics_dict['accuracy'] = None
+                    metrics_dict['f1'] = None
+                    metrics_dict['precision'] = None  
+                    metrics_dict['recall'] = None
+                
+                # These metrics should be available for multi-class
+                metrics_dict['roc_auc'] = safe_h2o_metric(lambda: perf.auc(), is_multiclass, 'roc_auc')
+                
+            else:
+                # For binary classification, use standard methods
+                metrics_dict['accuracy'] = safe_h2o_metric(lambda: perf.accuracy(), is_multiclass, 'accuracy')
+                metrics_dict['f1'] = safe_h2o_metric(lambda: perf.F1(), is_multiclass, 'f1')
+                metrics_dict['precision'] = safe_h2o_metric(lambda: perf.precision(), is_multiclass, 'precision')
+                metrics_dict['recall'] = safe_h2o_metric(lambda: perf.recall(), is_multiclass, 'recall')
+                metrics_dict['roc_auc'] = safe_h2o_metric(lambda: perf.auc(), is_multiclass, 'roc_auc')
+            
+            # These metrics should be available for both binary and multi-class
+            metrics_dict['logloss'] = safe_h2o_metric(lambda: perf.logloss(), is_multiclass, 'logloss')
+            metrics_dict['aucpr'] = safe_h2o_metric(lambda: perf.aucpr(), is_multiclass, 'aucpr')
+            metrics_dict['mean_per_class_error'] = safe_h2o_metric(lambda: perf.mean_per_class_error(), is_multiclass, 'mean_per_class_error')
+            
         else:
-            metrics_dict['r2'] = safe_h2o_metric(lambda: perf.r2())
-            metrics_dict['rmse'] = safe_h2o_metric(lambda: perf.rmse())
-            metrics_dict['mae'] = safe_h2o_metric(lambda: perf.mae())
-            metrics_dict['mse'] = safe_h2o_metric(lambda: perf.mse())
-            metrics_dict['rmsle'] = safe_h2o_metric(lambda: perf.rmsle())
-            metrics_dict['mean_residual_deviance'] = safe_h2o_metric(lambda: perf.mean_residual_deviance())
+            # For regression
+            metrics_dict['r2'] = safe_h2o_metric(lambda: perf.r2(), False, 'r2')
+            metrics_dict['rmse'] = safe_h2o_metric(lambda: perf.rmse(), False, 'rmse')
+            metrics_dict['mae'] = safe_h2o_metric(lambda: perf.mae(), False, 'mae')
+            metrics_dict['mse'] = safe_h2o_metric(lambda: perf.mse(), False, 'mse')
+            metrics_dict['rmsle'] = safe_h2o_metric(lambda: perf.rmsle(), False, 'rmsle')
+            metrics_dict['mean_residual_deviance'] = safe_h2o_metric(lambda: perf.mean_residual_deviance(), False, 'mean_residual_deviance')
     except Exception as e:
         print(f"Error extracting H2O metrics: {e}")
     return metrics_dict
